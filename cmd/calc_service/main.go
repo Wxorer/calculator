@@ -2,47 +2,53 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// Calc вычисляет значение математического выражения
+type CalculateRequest struct {
+	Expression string `json:"expression"`
+}
+
+type CalculateResponse struct {
+	Result float64 `json:"result,omitempty"`
+	Error  string  `json:"error,omitempty"`
+}
+
 func Calc(expression string) (float64, error) {
-	// Удаляем пробелы из выражения
 	expression = strings.ReplaceAll(expression, " ", "")
 
 	if len(expression) == 0 {
 		return 0, errors.New("пустое выражение")
 	}
 
-	// Преобразуем выражение в токены (числа и операторы)
 	tokens, err := parseExpression(expression)
 	if err != nil {
 		return 0, err
 	}
 
-	// Преобразуем инфиксную запись в постфиксную
 	postfix, err := toPostfix(tokens)
 	if err != nil {
 		return 0, err
 	}
 
-	// Вычисляем результат
 	return calculatePostfix(postfix)
 }
 
-// Структура для хранения токена (число или оператор)
 type token struct {
 	value    string
 	isNumber bool
 }
 
-// parseExpression разбирает строку на токены
 func parseExpression(expr string) ([]token, error) {
 	var tokens []token
 	var currentNumber string
 
-	// Обработка отрицательных чисел в начале выражения или после открывающей скобки
 	if expr[0] == '-' {
 		expr = "0" + expr
 	}
@@ -57,7 +63,6 @@ func parseExpression(expr string) ([]token, error) {
 
 		case char == '+' || char == '-' || char == '*' || char == '/' || char == '(' || char == ')':
 			if currentNumber != "" {
-				// Преобразуем строку в число и проверяем корректность
 				if _, err := strconv.ParseFloat(currentNumber, 64); err != nil {
 					return nil, errors.New("некорректное число: " + currentNumber)
 				}
@@ -81,7 +86,6 @@ func parseExpression(expr string) ([]token, error) {
 	return tokens, nil
 }
 
-// Возвращает приоритет оператора
 func priority(op string) int {
 	switch op {
 	case "+", "-":
@@ -93,7 +97,6 @@ func priority(op string) int {
 	}
 }
 
-// toPostfix преобразует инфиксную запись в постфиксную (обратную польскую нотацию)
 func toPostfix(tokens []token) ([]token, error) {
 	var result []token
 	var stack []string
@@ -116,10 +119,9 @@ func toPostfix(tokens []token) ([]token, error) {
 			if len(stack) == 0 {
 				return nil, errors.New("несбалансированные скобки")
 			}
-			// Удаляем открывающую скобку
 			stack = stack[:len(stack)-1]
 
-		default: // операторы
+		default:
 			for len(stack) > 0 && stack[len(stack)-1] != "(" &&
 				priority(stack[len(stack)-1]) >= priority(t.value) {
 				result = append(result, token{stack[len(stack)-1], false})
@@ -129,7 +131,6 @@ func toPostfix(tokens []token) ([]token, error) {
 		}
 	}
 
-	// Добавляем оставшиеся операторы
 	for len(stack) > 0 {
 		if stack[len(stack)-1] == "(" {
 			return nil, errors.New("несбалансированные скобки")
@@ -141,7 +142,6 @@ func toPostfix(tokens []token) ([]token, error) {
 	return result, nil
 }
 
-// calculatePostfix вычисляет значение выражения в постфиксной записи
 func calculatePostfix(tokens []token) (float64, error) {
 	var stack []float64
 
@@ -155,12 +155,11 @@ func calculatePostfix(tokens []token) (float64, error) {
 		if len(stack) < 2 {
 			return 0, errors.New("некорректное выражение")
 		}
-		// Берем два последних числа из стека
+
 		b := stack[len(stack)-1]
 		a := stack[len(stack)-2]
 		stack = stack[:len(stack)-2]
 
-		// Выполняем операцию
 		var result float64
 		switch t.value {
 		case "+":
@@ -184,4 +183,60 @@ func calculatePostfix(tokens []token) (float64, error) {
 	}
 
 	return stack[0], nil
+}
+
+func calculateHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	requestID := fmt.Sprintf("%d", startTime.UnixNano())
+
+	log.Printf("[%s] Получен новый запрос %s %s", requestID, r.Method, r.URL.Path)
+
+	if r.Method != http.MethodPost {
+		log.Printf("[%s] Метод не разрешен: %s", requestID, r.Method)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[%s] Ошибка при чтении тела запроса: %v", requestID, err)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		fmt.Fprint(w, "Expression is not valid")
+		return
+	}
+	expression := string(body)
+
+	log.Printf("[%s] Получено выражение для вычисления: %s", requestID, expression)
+
+	result, err := Calc(expression)
+	if err != nil {
+		switch err.Error() {
+		case "неподдерживаемый символ", "некорректное число", "некорректное выражение", "несбалансированные скобки", "пустое выражение":
+			log.Printf("[%s] Ошибка валидации: %v", requestID, err)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			fmt.Fprint(w, "Expression is not valid")
+		default:
+			log.Printf("[%s] Внутренняя ошибка: %v", requestID, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, "Internal server error")
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "%v", result)
+
+	duration := time.Since(startTime)
+	log.Printf("[%s] Запрос обработан успешно за %v. Результат: %v", requestID, duration, result)
+}
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	log.Printf("Запуск сервера на порту :8080")
+
+	http.HandleFunc("/api/v1/calculate", calculateHandler)
+
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
 }
